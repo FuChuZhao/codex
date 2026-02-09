@@ -97,6 +97,7 @@ pub use codex_git::GhostSnapshotConfig;
 /// the context window.
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
+pub(crate) const DEFAULT_AGENT_MAX_SPAWN_DEPTH: Option<usize> = Some(2);
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 
@@ -274,6 +275,8 @@ pub struct Config {
 
     /// Maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
+    /// Maximum depth for thread-spawned subagents.
+    pub agent_max_spawn_depth: Option<usize>,
 
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
@@ -1109,6 +1112,9 @@ pub struct AgentsToml {
     /// When unset, no limit is enforced.
     #[schemars(range(min = 1))]
     pub max_threads: Option<usize>,
+    /// Maximum depth for thread-spawned subagents.
+    #[schemars(range(min = 1))]
+    pub max_spawn_depth: Option<usize>,
 }
 
 impl From<ToolsToml> for Tools {
@@ -1525,6 +1531,25 @@ impl Config {
                 "agents.max_threads must be at least 1",
             ));
         }
+        let agent_max_spawn_depth = cfg
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.max_spawn_depth)
+            .or(DEFAULT_AGENT_MAX_SPAWN_DEPTH);
+        if agent_max_spawn_depth == Some(0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agents.max_spawn_depth must be at least 1",
+            ));
+        }
+        if let Some(max_spawn_depth) = agent_max_spawn_depth
+            && max_spawn_depth > i32::MAX as usize
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agents.max_spawn_depth must fit within a 32-bit signed integer",
+            ));
+        }
 
         let ghost_snapshot = {
             let mut config = GhostSnapshotConfig::default();
@@ -1693,6 +1718,7 @@ impl Config {
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
             agent_max_threads,
+            agent_max_spawn_depth,
             codex_home,
             log_dir,
             config_layer_stack,
@@ -3961,6 +3987,7 @@ model_verbosity = "high"
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
                 agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+                agent_max_spawn_depth: DEFAULT_AGENT_MAX_SPAWN_DEPTH,
                 codex_home: fixture.codex_home(),
                 log_dir: fixture.codex_home().join("log"),
                 config_layer_stack: Default::default(),
@@ -4049,6 +4076,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            agent_max_spawn_depth: DEFAULT_AGENT_MAX_SPAWN_DEPTH,
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4152,6 +4180,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            agent_max_spawn_depth: DEFAULT_AGENT_MAX_SPAWN_DEPTH,
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4241,6 +4270,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            agent_max_spawn_depth: DEFAULT_AGENT_MAX_SPAWN_DEPTH,
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
