@@ -3668,47 +3668,66 @@ mod handlers {
         items: Vec<ResponseInputItem>,
         previous_context: &mut Option<Arc<TurnContext>>,
     ) {
-        let mut pending_items = match sess.inject_response_items(items).await {
-            Ok(()) => return,
-            Err(items) => items,
-        };
+        const MAX_TURN_RESTART_ATTEMPTS: usize = 3;
 
-        let mut turn_input = pop_leading_user_message_input(&mut pending_items).unwrap_or_default();
-        if turn_input.is_empty() {
-            turn_input.push(UserInput::Text {
-                text: String::new(),
-                text_elements: Vec::new(),
-            });
-        }
+        let mut pending_items = items;
+        let mut attempts = 0usize;
+        loop {
+            match sess.inject_response_items(pending_items).await {
+                Ok(()) => return,
+                Err(items_without_active_turn) => {
+                    pending_items = items_without_active_turn;
+                }
+            }
 
-        let current_context = sess.new_default_turn_with_sub_id(sub_id).await;
-        current_context.otel_manager.user_prompt(&turn_input);
-        sess.seed_initial_context_if_needed(&current_context).await;
-        let previous_model = sess.previous_model().await;
-        let update_items = sess.build_settings_update_items(
-            previous_context.as_ref(),
-            previous_model.as_deref(),
-            &current_context,
-        );
-        if !update_items.is_empty() {
-            sess.record_conversation_items(&current_context, &update_items)
-                .await;
-        }
+            if attempts >= MAX_TURN_RESTART_ATTEMPTS {
+                warn!(
+                    attempts,
+                    remaining_items = pending_items.len(),
+                    "dropping response items after repeated turn restart failures"
+                );
+                return;
+            }
+            attempts += 1;
 
-        sess.refresh_mcp_servers_if_requested(&current_context)
-            .await;
-        let regular_task = sess.take_startup_regular_task().await.unwrap_or_default();
-        sess.spawn_task(Arc::clone(&current_context), turn_input, regular_task)
-            .await;
-        *previous_context = Some(Arc::clone(&current_context));
+            let mut turn_input =
+                pop_leading_user_message_input(&mut pending_items).unwrap_or_default();
+            if turn_input.is_empty() {
+                turn_input.push(UserInput::Text {
+                    text: String::new(),
+                    text_elements: Vec::new(),
+                });
+            }
 
-        if !pending_items.is_empty()
-            && let Err(remaining_items) = sess.inject_response_items(pending_items).await
-        {
-            warn!(
-                remaining_items = remaining_items.len(),
-                "failed to inject response items after starting a turn"
+            let turn_sub_id = if attempts == 1 {
+                sub_id.clone()
+            } else {
+                format!("{sub_id}-retry-{attempts}")
+            };
+            let current_context = sess.new_default_turn_with_sub_id(turn_sub_id).await;
+            current_context.otel_manager.user_prompt(&turn_input);
+            sess.seed_initial_context_if_needed(&current_context).await;
+            let previous_model = sess.previous_model().await;
+            let update_items = sess.build_settings_update_items(
+                previous_context.as_ref(),
+                previous_model.as_deref(),
+                &current_context,
             );
+            if !update_items.is_empty() {
+                sess.record_conversation_items(&current_context, &update_items)
+                    .await;
+            }
+
+            sess.refresh_mcp_servers_if_requested(&current_context)
+                .await;
+            let regular_task = sess.take_startup_regular_task().await.unwrap_or_default();
+            sess.spawn_task(Arc::clone(&current_context), turn_input, regular_task)
+                .await;
+            *previous_context = Some(current_context);
+
+            if pending_items.is_empty() {
+                return;
+            }
         }
     }
 

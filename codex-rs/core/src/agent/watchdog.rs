@@ -256,10 +256,13 @@ impl WatchdogManager {
                     );
                 }
             }
-            // Helpers finish quickly and we don't explicitly shut them down,
-            // so we must release their spawn slot here to avoid exhausting
-            // the agent thread limit over time.
-            self.guards.release_spawned_thread(helper_id);
+            if let Err(err) = control_for_spawn.shutdown_agent(helper_id).await {
+                warn!(
+                    helper_id = %helper_id,
+                    owner_thread_id = %snapshot.owner_thread_id,
+                    "watchdog helper cleanup failed: {err}"
+                );
+            }
             self.update_after_spawn(target_thread_id, generation, now, None)
                 .await;
             return;
@@ -277,19 +280,14 @@ impl WatchdogManager {
         // Watchdog helpers are short-lived check-ins. Keep their state in-memory and
         // avoid writing full forked rollout history to disk for each helper run.
         helper_config.ephemeral = true;
-        let watchdog_instructions =
-            watchdog_developer_instructions(&helper_config, snapshot.owner_thread_id).await;
-        helper_config.developer_instructions = Some(match helper_config.developer_instructions {
-            Some(existing) if !existing.trim().is_empty() => {
-                format!("{watchdog_instructions}\n\n{existing}")
-            }
-            _ => watchdog_instructions,
-        });
+        let helper_prompt =
+            watchdog_helper_prompt(&helper_config, snapshot.owner_thread_id, &snapshot.prompt)
+                .await;
         let spawn_result = control_for_spawn
             .fork_agent(
                 helper_config,
                 vec![UserInput::Text {
-                    text: snapshot.prompt.clone(),
+                    text: helper_prompt,
                     text_elements: Vec::new(),
                 }],
                 snapshot.owner_thread_id,
@@ -539,7 +537,15 @@ fn tick_duration() -> Duration {
     Duration::from_secs(seconds)
 }
 
-async fn watchdog_developer_instructions(config: &Config, target_thread_id: ThreadId) -> String {
+async fn watchdog_helper_prompt(
+    config: &Config,
+    target_thread_id: ThreadId,
+    prompt: &str,
+) -> String {
     let watchdog_prompt = load_watchdog_prompt(&config.codex_home).await;
-    format!("{watchdog_prompt}\n\nTarget agent id: {target_thread_id}")
+    if prompt.trim().is_empty() {
+        format!("{watchdog_prompt}\n\nTarget agent id: {target_thread_id}")
+    } else {
+        format!("{watchdog_prompt}\n\nTarget agent id: {target_thread_id}\n\n{prompt}")
+    }
 }

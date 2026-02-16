@@ -5,6 +5,7 @@ use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::error::CodexErr;
+use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -181,8 +182,16 @@ mod spawn {
                 .into(),
             )
             .await;
-        let mut config =
-            build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+        let config_strategy = match spawn_mode {
+            SpawnMode::Spawn => SpawnConfigStrategy::ContextFreeSpawn,
+            SpawnMode::Fork | SpawnMode::Watchdog => SpawnConfigStrategy::ForkLike,
+        };
+        let mut config = build_agent_spawn_config(
+            &session.get_base_instructions().await,
+            turn.as_ref(),
+            child_depth,
+            config_strategy,
+        )?;
         agent_role
             .apply_to_config(&mut config)
             .map_err(FunctionCallError::RespondToModel)?;
@@ -544,7 +553,7 @@ mod resume_agent {
             ))
         })?;
 
-        let config = build_agent_resume_config(turn.as_ref())?;
+        let config = build_agent_resume_config(turn.as_ref(), child_depth)?;
         let resumed_thread_id = session
             .services
             .agent_control
@@ -769,7 +778,7 @@ mod wait {
                     "timeout_ms must be greater than zero".to_owned(),
                 ));
             }
-            ms => ms.min(MAX_WAIT_TIMEOUT_MS),
+            ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
         };
 
         session
@@ -1124,43 +1133,53 @@ fn input_preview(items: &[UserInput]) -> String {
 fn build_agent_spawn_config(
     base_instructions: &BaseInstructions,
     turn: &TurnContext,
+    child_depth: i32,
+    strategy: SpawnConfigStrategy,
 ) -> Result<Config, FunctionCallError> {
-    let base_config = turn.config.as_ref();
-    let mut config = base_config.clone();
+    let mut config = build_agent_shared_config(turn, child_depth)?;
     config.base_instructions = Some(base_instructions.text.clone());
-    config.model = Some(turn.model_info.slug.clone());
-    config.model_reasoning_effort = turn.reasoning_effort;
-    config.model_reasoning_summary = turn.reasoning_summary;
-    // Use the underlying config's developer instructions rather than the turn-level
-    // instructions. The turn-level instructions already include the root role prompt,
-    // which would otherwise leak into subagents/watchdog helpers.
-    config.developer_instructions = base_config.developer_instructions.clone();
-    config.compact_prompt = turn.compact_prompt.clone();
-    config.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
-    config.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
-    config.cwd = turn.cwd.clone();
-    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-    config
-        .permissions
-        .sandbox_policy
-        .set(turn.sandbox_policy.clone())
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
-        })?;
+    let base_config = turn.config.as_ref();
+    match strategy {
+        SpawnConfigStrategy::ContextFreeSpawn => {
+            // Context-free subagents should use base config instructions.
+            config.developer_instructions = base_config.developer_instructions.clone();
+            // At max depth, a freshly spawned context-free child cannot spawn further descendants.
+            // Hide collab tools to match that capability boundary.
+            if crate::agent::exceeds_thread_spawn_depth_limit(child_depth + 1) {
+                config.features.disable(Feature::Collab);
+            }
+        }
+        SpawnConfigStrategy::ForkLike => {
+            // Fork/watchdog children should preserve turn-level developer context
+            // to maximize prompt/cache parity with the parent thread.
+            config.developer_instructions = turn.developer_instructions.clone();
+        }
+    }
     Ok(config)
 }
 
-fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
+fn build_agent_resume_config(
+    turn: &TurnContext,
+    child_depth: i32,
+) -> Result<Config, FunctionCallError> {
+    let base_config = turn.config.as_ref();
+    let mut config = build_agent_shared_config(turn, child_depth)?;
+    // For resume, keep base instructions sourced from rollout/session metadata.
+    config.base_instructions = None;
+    config.developer_instructions = base_config.developer_instructions.clone();
+    Ok(config)
+}
+
+fn build_agent_shared_config(
+    turn: &TurnContext,
+    child_depth: i32,
+) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.as_ref();
     let mut config = base_config.clone();
-    config.base_instructions = None;
     config.model = Some(turn.model_info.slug.clone());
+    config.model_provider = turn.provider.clone();
     config.model_reasoning_effort = turn.reasoning_effort;
     config.model_reasoning_summary = turn.reasoning_summary;
-    // Use the underlying config's developer instructions rather than the turn-level
-    // instructions. The turn-level instructions already include the root role prompt,
-    // which would otherwise leak into resumed agents.
-    config.developer_instructions = base_config.developer_instructions.clone();
     config.compact_prompt = turn.compact_prompt.clone();
     config.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
     config.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
@@ -1173,7 +1192,18 @@ fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, FunctionCallE
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
+
+    // Keep collab tool surface identical across root/subagent depths.
+    // Depth limits are still enforced by spawn/resume handlers.
+    let _ = child_depth;
+
     Ok(config)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnConfigStrategy {
+    ContextFreeSpawn,
+    ForkLike,
 }
 
 #[cfg(test)]
@@ -1186,6 +1216,7 @@ mod tests {
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
     use crate::config::types::ShellEnvironmentPolicy;
+    use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
     use crate::protocol::AskForApproval;
     use crate::protocol::Op;
@@ -1914,6 +1945,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_clamps_short_timeouts_to_minimum() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "timeout_ms": 10
+            })),
+        );
+
+        let early = timeout(Duration::from_millis(50), CollabHandler.handle(invocation)).await;
+        assert!(
+            early.is_err(),
+            "wait should not return before the minimum timeout clamp"
+        );
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
     async fn wait_returns_final_status_without_timeout() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
@@ -2047,7 +2109,13 @@ mod tests {
             turn.config.permissions.sandbox_policy.get().clone(),
         );
 
-        let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+        let config = build_agent_spawn_config(
+            &base_instructions,
+            &turn,
+            0,
+            SpawnConfigStrategy::ContextFreeSpawn,
+        )
+        .expect("spawn config");
         let mut expected = (*turn.config).clone();
         expected.base_instructions = Some(base_instructions.text);
         expected.model = Some(turn.model_info.slug.clone());
@@ -2084,8 +2152,96 @@ mod tests {
             text: "base".to_string(),
         };
 
-        let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+        let config = build_agent_spawn_config(
+            &base_instructions,
+            &turn,
+            0,
+            SpawnConfigStrategy::ContextFreeSpawn,
+        )
+        .expect("spawn config");
 
         assert_eq!(config.user_instructions, base_config.user_instructions);
+    }
+
+    #[tokio::test]
+    async fn build_agent_resume_config_uses_shared_fields() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config.base_instructions = Some("caller-base".to_string());
+        base_config.developer_instructions = Some("base-dev".to_string());
+        turn.developer_instructions = Some("turn-dev".to_string());
+        turn.config = Arc::new(base_config.clone());
+
+        let config = build_agent_resume_config(&turn, 0).expect("resume config");
+
+        let mut expected = base_config;
+        expected.base_instructions = None;
+        expected.model = Some(turn.model_info.slug.clone());
+        expected.model_provider = turn.provider.clone();
+        expected.model_reasoning_effort = turn.reasoning_effort;
+        expected.model_reasoning_summary = turn.reasoning_summary;
+        expected.compact_prompt = turn.compact_prompt.clone();
+        expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
+        expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
+        expected.cwd = turn.cwd.clone();
+        expected
+            .permissions
+            .approval_policy
+            .set(AskForApproval::Never)
+            .expect("approval policy set");
+        expected
+            .permissions
+            .sandbox_policy
+            .set(turn.sandbox_policy)
+            .expect("sandbox policy set");
+        assert_eq!(config, expected);
+    }
+
+    #[tokio::test]
+    async fn build_agent_spawn_config_fork_like_uses_turn_developer_instructions() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config.developer_instructions = Some("base-dev".to_string());
+        base_config.features.enable(Feature::Collab);
+        turn.config = Arc::new(base_config.clone());
+        turn.developer_instructions = Some("turn-dev".to_string());
+        let base_instructions = BaseInstructions {
+            text: "base".to_string(),
+        };
+
+        let config = build_agent_spawn_config(
+            &base_instructions,
+            &turn,
+            MAX_THREAD_SPAWN_DEPTH,
+            SpawnConfigStrategy::ForkLike,
+        )
+        .expect("fork-like spawn config");
+
+        assert_eq!(config.developer_instructions, turn.developer_instructions);
+        assert_eq!(
+            config.features.enabled(Feature::Collab),
+            base_config.features.enabled(Feature::Collab)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_agent_spawn_config_context_free_disables_collab_at_max_depth() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config.features.enable(Feature::Collab);
+        turn.config = Arc::new(base_config);
+        let base_instructions = BaseInstructions {
+            text: "base".to_string(),
+        };
+
+        let config = build_agent_spawn_config(
+            &base_instructions,
+            &turn,
+            MAX_THREAD_SPAWN_DEPTH,
+            SpawnConfigStrategy::ContextFreeSpawn,
+        )
+        .expect("context-free spawn config");
+
+        assert_eq!(config.features.enabled(Feature::Collab), false);
     }
 }
