@@ -2318,9 +2318,6 @@ impl App {
                     ));
                 }
             }
-            AppEvent::OpenApprovalsPopup => {
-                self.chat_widget.open_approvals_popup();
-            }
             AppEvent::OpenAgentPicker => {
                 self.open_agent_picker().await;
             }
