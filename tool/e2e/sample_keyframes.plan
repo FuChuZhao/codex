@@ -1,0 +1,17 @@
+# Open note list against seeded workspace
+TYPE ./out/bin/codex note list --workspace ./e2e-workspace
+KEY Enter
+WAIT 1
+CAPTURE note-list
+
+# Search seeded content
+TYPE ./out/bin/codex search rollback --workspace ./e2e-workspace
+KEY Enter
+WAIT 1
+CAPTURE search
+
+# Show snapshot resume context
+TYPE ./out/bin/codex snapshot resume --workspace ./e2e-workspace --snapshot s_seed_1
+KEY Enter
+WAIT 1
+CAPTURE snapshot-resume

@@ -1,0 +1,82 @@
+# Copy this file to BUILD_REPO:.github/workflows/private-source-cloud-build.yml
+# and trigger only via workflow_dispatch.
+
+name: private-source-cloud-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Private SOURCE_REPO in OWNER/REPO format'
+        required: true
+        type: string
+      source_ref:
+        description: 'Branch/tag/commit from SOURCE_REPO to build'
+        required: true
+        default: main
+        type: string
+      artifact_name:
+        description: 'Artifact name to upload'
+        required: true
+        default: codex-cloud-build
+        type: string
+      build_script:
+        description: 'Build entry script path inside SOURCE_REPO'
+        required: true
+        default: tool/ci/build_codex_cli_release.sh
+        type: string
+      artifact_path:
+        description: 'Output path inside SOURCE_REPO to upload as artifact'
+        required: true
+        default: out
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH for private source clone
+        shell: bash
+        env:
+          SOURCE_REPO_SSH_KEY: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${SOURCE_REPO_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone source
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "git@github.com:${SOURCE_REPO}.git" source
+          cd source
+          git fetch --depth 1 origin "${SOURCE_REF}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Run private build script
+        shell: bash
+        env:
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+        run: |
+          set -euo pipefail
+          cd source
+          chmod +x "${BUILD_SCRIPT}" || true
+          "${BUILD_SCRIPT}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: source/${{ inputs.artifact_path }}
+          retention-days: 1
+          if-no-files-found: error

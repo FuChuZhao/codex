@@ -1,0 +1,143 @@
+name: private-source-cloud-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Private SOURCE_REPO in OWNER/REPO format'
+        required: true
+        type: string
+      source_ref:
+        description: 'Branch/tag/commit from SOURCE_REPO to build'
+        required: true
+        default: main
+        type: string
+      artifact_name:
+        description: 'Artifact name to upload'
+        required: true
+        default: codex-cloud-build
+        type: string
+      build_script:
+        description: 'Build entry script path inside SOURCE_REPO'
+        required: true
+        default: tool/ci/build_codex_cli_release.sh
+        type: string
+      artifact_path:
+        description: 'Output path inside SOURCE_REPO to upload as artifact'
+        required: true
+        default: out
+        type: string
+      run_e2e:
+        description: 'Run keyframe e2e capture'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      e2e_script:
+        description: 'E2E entry script path inside SOURCE_REPO'
+        required: true
+        default: tool/e2e/run_notes_e2e_keyframes.sh
+        type: string
+      e2e_out_dir:
+        description: 'E2E output dir inside SOURCE_REPO'
+        required: true
+        default: out/e2e
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout BUILD_REPO workflow repo
+        uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tmux ca-certificates
+
+      - name: Configure SSH for private source clone
+        shell: bash
+        env:
+          SOURCE_REPO_SSH_KEY: ${{ secrets.SOURCE_REPO_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SOURCE_REPO_SSH_KEY}" ]]; then
+            echo "SOURCE_REPO_SSH_KEY is required" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${SOURCE_REPO_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Clone SOURCE_REPO at source_ref
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "git@github.com:${SOURCE_REPO}.git" source
+          cd source
+          git fetch --depth 1 origin "${SOURCE_REF}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Build SOURCE_REPO artifacts
+        shell: bash
+        env:
+          BUILD_SCRIPT: ${{ inputs.build_script }}
+        run: |
+          set -euo pipefail
+          cd source
+          if [[ ! -x "${BUILD_SCRIPT}" ]]; then
+            chmod +x "${BUILD_SCRIPT}"
+          fi
+          "${BUILD_SCRIPT}"
+
+      - name: Run fullscreen keyframe e2e capture
+        if: ${{ inputs.run_e2e == 'true' }}
+        shell: bash
+        env:
+          E2E_SCRIPT: ${{ inputs.e2e_script }}
+          E2E_OUT_DIR: ${{ inputs.e2e_out_dir }}
+        run: |
+          set -euo pipefail
+          cd source
+          if [[ ! -x "${E2E_SCRIPT}" ]]; then
+            chmod +x "${E2E_SCRIPT}"
+          fi
+          "${E2E_SCRIPT}" \
+            --workspace "$(pwd)" \
+            --codex-bin "$(pwd)/out/bin/codex" \
+            --out-dir "$(pwd)/${E2E_OUT_DIR}"
+
+      - name: Validate artifact path
+        shell: bash
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+        run: |
+          set -euo pipefail
+          if [[ ! -e "source/${ARTIFACT_PATH}" ]]; then
+            echo "artifact path not found: source/${ARTIFACT_PATH}" >&2
+            exit 1
+          fi
+
+      - name: Upload artifact (retention 1 day)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: source/${{ inputs.artifact_path }}
+          if-no-files-found: error
+          retention-days: 1

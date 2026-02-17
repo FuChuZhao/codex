@@ -36,6 +36,7 @@ mod app_cmd;
 #[cfg(target_os = "macos")]
 mod desktop_app;
 mod mcp_cmd;
+mod notes_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -80,6 +81,30 @@ struct MultitoolCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
+    /// Manage local note conversations.
+    Conversation(notes_cmd::ConversationCli),
+
+    /// Manage local note messages.
+    Message(notes_cmd::MessageCli),
+
+    /// Manage notes and annotations.
+    Note(notes_cmd::NoteCli),
+
+    /// Manage note branches.
+    Branch(notes_cmd::BranchCli),
+
+    /// Manage note snapshots.
+    Snapshot(notes_cmd::SnapshotCli),
+
+    /// Search notes, snapshots, and note messages.
+    Search(notes_cmd::SearchArgs),
+
+    /// Export note conversations.
+    Export(notes_cmd::ExportCli),
+
+    /// Rebuild note index.
+    Index(notes_cmd::IndexCli),
+
     /// Run Codex non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
@@ -569,6 +594,30 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             );
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
             handle_app_exit(exit_info)?;
+        }
+        Some(Subcommand::Conversation(cli)) => {
+            notes_cmd::run_conversation(cli)?;
+        }
+        Some(Subcommand::Message(cli)) => {
+            notes_cmd::run_message(cli)?;
+        }
+        Some(Subcommand::Note(cli)) => {
+            notes_cmd::run_note(cli)?;
+        }
+        Some(Subcommand::Branch(cli)) => {
+            notes_cmd::run_branch(cli)?;
+        }
+        Some(Subcommand::Snapshot(cli)) => {
+            notes_cmd::run_snapshot(cli)?;
+        }
+        Some(Subcommand::Search(args)) => {
+            notes_cmd::run_search(args)?;
+        }
+        Some(Subcommand::Export(cli)) => {
+            notes_cmd::run_export(cli)?;
+        }
+        Some(Subcommand::Index(cli)) => {
+            notes_cmd::run_index(cli)?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
             prepend_config_flags(
