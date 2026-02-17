@@ -143,13 +143,17 @@ echo "Resolving newly triggered run id ..."
 run_id=""
 for _ in $(seq 1 40); do
   runs_json="$(gh run list -R "$BUILD_REPO" --workflow "$WORKFLOW" --event workflow_dispatch --limit 30 --json databaseId,createdAt,status,conclusion,headBranch)"
-  run_id="$(python3 - "$start_epoch" <<'PY'
+  run_id="$(RUNS_JSON="$runs_json" python3 - "$start_epoch" <<'PY'
 import datetime as dt
 import json
+import os
 import sys
 
 start_epoch = int(sys.argv[1])
-rows = json.load(sys.stdin)
+try:
+    rows = json.loads(os.environ.get("RUNS_JSON", "[]"))
+except json.JSONDecodeError:
+    rows = []
 
 best = None
 for row in rows:
@@ -167,7 +171,7 @@ for row in rows:
 
 print(best[1] if best else "")
 PY
-<<<"$runs_json")"
+)"
   if [[ -n "$run_id" ]]; then
     break
   fi

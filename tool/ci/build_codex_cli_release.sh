@@ -9,7 +9,9 @@ META_OUT_DIR="${OUT_DIR}/meta"
 mkdir -p "${BIN_OUT_DIR}" "${META_OUT_DIR}"
 
 pushd "${ROOT_DIR}/codex-rs" >/dev/null
-cargo build -p codex-cli --release --locked
+# Build in cloud without forcing a lockfile rewrite failure when source_ref carries
+# dependency edits that are not yet reflected in Cargo.lock.
+cargo build -p codex-cli --release
 popd >/dev/null
 
 BIN_PATH="${ROOT_DIR}/codex-rs/target/release/codex"
